@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -172,6 +174,65 @@ class ConfluenceClient:
             payload=payload,
         )
 
+    def create_page_from_html(
+        self,
+        title: str,
+        html_body: str,
+        space_key: str | None = None,
+        space_id: str | int | None = None,
+        parent_id: str | int | None = None,
+        status: str = "current",
+        subtype: str | None = "live",
+        embedded: bool | None = None,
+        private: bool | None = None,
+        root_level: bool | None = None,
+    ) -> dict[str, Any]:
+        return self.create_page(
+            title=title,
+            body=self._html_to_storage_body(html_body),
+            space_key=space_key,
+            space_id=space_id,
+            parent_id=parent_id,
+            representation="storage",
+            status=status,
+            subtype=subtype,
+            embedded=embedded,
+            private=private,
+            root_level=root_level,
+        )
+
+    def create_page_from_template(
+        self,
+        template_id: str,
+        title: str,
+        space_key: str | None = None,
+        space_id: str | int | None = None,
+        parent_id: str | int | None = None,
+        replacements: dict[str, Any] | None = None,
+        status: str = "current",
+        subtype: str | None = "live",
+    ) -> dict[str, Any]:
+        template = self.get_content_template(
+            template_id,
+            expand=("body.storage", "body.view"),
+        )
+        template_body = self._template_body_value(template, "storage")
+        if template_body is None:
+            template_body = self._template_body_value(template, "view")
+
+        if template_body is None:
+            raise ValueError(f"Template {template_id} does not include a body.")
+
+        return self.create_page_from_html(
+            title=title,
+            html_body=self._apply_template_replacements(template_body, replacements),
+            space_key=space_key,
+            space_id=space_id,
+            parent_id=parent_id,
+            status=status,
+            subtype=subtype,
+        )
+
     def create_child_page(
         self,
         parent_page_url: str,
@@ -192,6 +253,52 @@ class ConfluenceClient:
             space_id=space_id,
             parent_id=parent_page["id"],
             representation=representation,
+            status=status,
+            subtype=subtype,
+        )
+
+    def create_child_page_from_html(
+        self,
+        parent_page_url: str,
+        title: str,
+        html_body: str,
+        status: str = "current",
+        subtype: str | None = "live",
+    ) -> dict[str, Any]:
+        parent_page = self.get_page_context_by_url(parent_page_url)
+        space_id = parent_page.get("space", {}).get("id")
+        if not space_id:
+            raise ValueError(f"Could not resolve parent page space ID: {parent_page_url}")
+
+        return self.create_page_from_html(
+            title=title,
+            html_body=html_body,
+            space_id=space_id,
+            parent_id=parent_page["id"],
+            status=status,
+            subtype=subtype,
+        )
+
+    def create_child_page_from_template(
+        self,
+        parent_page_url: str,
+        template_id: str,
+        title: str,
+        replacements: dict[str, Any] | None = None,
+        status: str = "current",
+        subtype: str | None = "live",
+    ) -> dict[str, Any]:
+        parent_page = self.get_page_context_by_url(parent_page_url)
+        space_id = parent_page.get("space", {}).get("id")
+        if not space_id:
+            raise ValueError(f"Could not resolve parent page space ID: {parent_page_url}")
+
+        return self.create_page_from_template(
+            template_id=template_id,
+            title=title,
+            space_id=space_id,
+            parent_id=parent_page["id"],
+            replacements=replacements,
             status=status,
             subtype=subtype,
         )
@@ -292,6 +399,170 @@ class ConfluenceClient:
                 "limit": limit,
             },
         )
+
+    def list_content_templates(
+        self,
+        space_key: str | None = None,
+        template_kind: str = "page",
+        start: int = 0,
+        limit: int = 25,
+        expand: str | list[str] | tuple[str, ...] | None = ("body.storage", "body.view"),
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "start": start,
+            "limit": limit,
+        }
+        if space_key:
+            params["spaceKey"] = space_key
+
+        expand_value = self._expand_value(expand)
+        if expand_value:
+            params["expand"] = expand_value
+
+        return self._request_confluence_json(
+            "GET",
+            f"template/{template_kind}",
+            params=params,
+        )
+
+    def get_content_template(
+        self,
+        template_id: str,
+        expand: str | list[str] | tuple[str, ...] | None = ("body.storage", "body.view"),
+    ) -> dict[str, Any]:
+        params = {}
+        expand_value = self._expand_value(expand)
+        if expand_value:
+            params["expand"] = expand_value
+
+        return self._request_confluence_json(
+            "GET",
+            f"template/{template_id}",
+            params=params or None,
+        )
+
+    def get_content_template_html(
+        self,
+        template_id: str,
+        html_format: str = "view",
+        wait_seconds: float = 20,
+        poll_interval_seconds: float = 0.5,
+    ) -> dict[str, Any]:
+        template = self.get_content_template(
+            template_id,
+            expand=(f"body.{html_format}", "body.storage"),
+        )
+        html = self._template_body_value(template, html_format)
+        if html is None:
+            storage_body = self._template_body_value(template, "storage")
+            if storage_body is None:
+                raise ValueError(f"Template {template_id} does not include a storage body.")
+
+            converted_body = self.convert_content_body(
+                value=storage_body,
+                from_representation="storage",
+                to_representation=html_format,
+                wait_seconds=wait_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+            html = converted_body.get("value", "")
+
+        return self._template_context(template, html_format=html_format, html=html)
+
+    def list_content_templates_html(
+        self,
+        space_key: str | None = None,
+        template_kind: str = "page",
+        start: int = 0,
+        limit: int = 25,
+        html_format: str = "view",
+        wait_seconds: float = 20,
+        poll_interval_seconds: float = 0.5,
+    ) -> dict[str, Any]:
+        response = self.list_content_templates(
+            space_key=space_key,
+            template_kind=template_kind,
+            start=start,
+            limit=limit,
+            expand=(f"body.{html_format}", "body.storage"),
+        )
+        templates = []
+        for template in response.get("results", []):
+            template_id = self._template_id(template)
+            try:
+                templates.append(
+                    self.get_content_template_html(
+                        template_id=template_id,
+                        html_format=html_format,
+                        wait_seconds=wait_seconds,
+                        poll_interval_seconds=poll_interval_seconds,
+                    )
+                )
+            except ValueError:
+                html = self._template_body_value(template, html_format) or ""
+                templates.append(self._template_context(template, html_format=html_format, html=html))
+
+        return {
+            "results": templates,
+            "start": response.get("start", start),
+            "limit": response.get("limit", limit),
+            "size": response.get("size", len(templates)),
+            "_links": response.get("_links", {}),
+        }
+
+    def convert_content_body(
+        self,
+        value: str,
+        from_representation: str = "storage",
+        to_representation: str = "view",
+        wait_seconds: float = 20,
+        poll_interval_seconds: float = 0.5,
+    ) -> dict[str, Any]:
+        task = self._request_confluence_json(
+            "POST",
+            f"contentbody/convert/async/{to_representation}",
+            payload={
+                "value": value,
+                "representation": from_representation,
+            },
+        )
+        async_id = task.get("asyncId") or task.get("id")
+        if not async_id:
+            return task
+
+        return self.get_converted_content_body(
+            async_id=async_id,
+            wait_seconds=wait_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def get_converted_content_body(
+        self,
+        async_id: str,
+        wait_seconds: float = 20,
+        poll_interval_seconds: float = 0.5,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + wait_seconds
+        last_response: dict[str, Any] | None = None
+
+        while True:
+            last_response = self._request_confluence_json(
+                "GET",
+                f"contentbody/convert/async/{async_id}",
+            )
+            status = str(last_response.get("status", "")).upper()
+            if last_response.get("value") is not None:
+                return last_response
+
+            if status in {"FAILED", "ERROR"}:
+                raise RuntimeError(f"Confluence content body conversion failed: {last_response}")
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for Confluence content body conversion: {last_response}"
+                )
+
+            time.sleep(poll_interval_seconds)
 
     def _request_confluence_json(
         self,
@@ -396,6 +667,77 @@ class ConfluenceClient:
             params["root-level"] = str(root_level).lower()
 
         return params or None
+
+    def _expand_value(self, expand: str | list[str] | tuple[str, ...] | None) -> str | None:
+        if expand is None:
+            return None
+
+        if isinstance(expand, str):
+            return expand
+
+        return ",".join(expand)
+
+    def _template_id(self, template: dict[str, Any]) -> str:
+        template_id = template.get("templateId") or template.get("id")
+        if not template_id:
+            raise ValueError(f"Template response does not include a template id: {template}")
+
+        return str(template_id)
+
+    def _template_body_value(self, template: dict[str, Any], representation: str) -> str | None:
+        body = template.get("body", {})
+        representation_body = body.get(representation) or {}
+        value = representation_body.get("value")
+        if value is None:
+            return None
+
+        return str(value)
+
+    def _template_context(
+        self,
+        template: dict[str, Any],
+        html_format: str,
+        html: str,
+    ) -> dict[str, Any]:
+        return {
+            "template_id": self._template_id(template),
+            "name": template.get("name"),
+            "description": template.get("description"),
+            "template_type": template.get("templateType"),
+            "editor_version": template.get("editorVersion"),
+            "space": template.get("space"),
+            "labels": template.get("labels", []),
+            "html_format": html_format,
+            "html": html,
+            "storage": self._template_body_value(template, "storage"),
+            "raw_template": template,
+        }
+
+    def _html_to_storage_body(self, html_body: str) -> str:
+        body = html_body.strip()
+        if not body:
+            raise ValueError("HTML body is required.")
+
+        if "<" not in body and ">" not in body:
+            return f"<p>{html.escape(body)}</p>"
+
+        return body
+
+    def _apply_template_replacements(
+        self,
+        template_body: str,
+        replacements: dict[str, Any] | None,
+    ) -> str:
+        if not replacements:
+            return template_body
+
+        rendered_body = template_body
+        for key, value in replacements.items():
+            replacement_value = str(value)
+            rendered_body = rendered_body.replace(f"{{{{{key}}}}}", replacement_value)
+            rendered_body = rendered_body.replace(f"${{{key}}}", replacement_value)
+
+        return rendered_body
 
     def _absolute_confluence_url(self, path_or_url: str) -> str:
         if path_or_url.startswith(("http://", "https://")):
