@@ -11,7 +11,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
@@ -197,6 +197,80 @@ class JiraClient:
             if max_pages is not None and page_count >= max_pages:
                 return issues
 
+    def get_jql_schema(
+        self,
+        jql: str,
+        fields: list[str] | None = None,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        response = self.search_issues(
+            jql=jql,
+            fields=fields or ["*all"],
+            max_results=max_results,
+            expand=["names", "schema"],
+        )
+        issues = response.get("issues", [])
+
+        return {
+            "jql": jql,
+            "names": response.get("names", {}),
+            "schema": response.get("schema", {}),
+            "issues": self.summarize_issues(issues),
+            "raw_issues": issues,
+            "count": len(issues),
+            "next_page_token": response.get("nextPageToken"),
+            "is_last": response.get("isLast"),
+        }
+
+    def get_issue_keys_schema(
+        self,
+        issue_keys: Iterable[str],
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_issue_keys = self._unique_values(issue_keys)
+        if not normalized_issue_keys:
+            return {
+                "jql": "",
+                "issue_keys": [],
+                "names": {},
+                "schema": {},
+                "issues": [],
+                "raw_issues": [],
+                "count": 0,
+                "next_page_token": None,
+                "is_last": True,
+            }
+
+        jql = f"key in ({', '.join(self._quote_jql_value(key) for key in normalized_issue_keys)})"
+        schema = self.get_jql_schema(
+            jql=jql,
+            fields=fields,
+            max_results=len(normalized_issue_keys),
+        )
+        schema["issue_keys"] = normalized_issue_keys
+        return schema
+
+    def get_jira_schema_from_page_url(
+        self,
+        page_url: str,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        issue_key = self.issue_key_from_url(page_url)
+        schema = self.get_issue_keys_schema([issue_key], fields=fields)
+        issue = schema["issues"][0] if schema["issues"] else None
+
+        return {
+            "page_url": page_url,
+            "issue_key": issue_key,
+            "issue_url": self.issue_url(issue_key),
+            "jql": schema["jql"],
+            "names": schema["names"],
+            "schema": schema["schema"],
+            "issue": issue,
+            "raw_issue": schema["raw_issues"][0] if schema["raw_issues"] else None,
+            "count": schema["count"],
+        }
+
     def get_issue(
         self,
         issue_key: str,
@@ -234,6 +308,130 @@ class JiraClient:
             "jira_links": jira_links["jira_links"],
             "ignored_jira_macros": jira_links["ignored_jira_macros"],
             "project_keys": sorted(normalized_project_keys),
+        }
+
+    def get_jira_schema_from_page_context(
+        self,
+        page_context: dict[str, Any],
+        project_keys: list[str] | tuple[str, ...] | set[str] | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        jira_macros = self.extract_jira_macros_from_page_context(page_context)
+        filtered_macros = []
+        ignored_jira_macros = []
+        normalized_project_keys = self.normalize_project_keys(project_keys)
+
+        for macro in jira_macros:
+            issue_key = macro.get("key")
+            if self.issue_matches_project_keys(issue_key, normalized_project_keys):
+                filtered_macros.append(macro)
+            else:
+                ignored_jira_macros.append(macro)
+
+        issue_keys = self._unique_values(
+            macro.get("key")
+            for macro in filtered_macros
+            if macro.get("key")
+        )
+        schema = self.get_issue_keys_schema(issue_keys, fields=fields)
+
+        return {
+            "page": {
+                "id": page_context.get("id"),
+                "title": page_context.get("title"),
+                "url": page_context.get("url"),
+                "space": page_context.get("space"),
+            },
+            "project_keys": sorted(normalized_project_keys),
+            "issue_keys": issue_keys,
+            "jira_macros": filtered_macros,
+            "ignored_jira_macros": ignored_jira_macros,
+            "jql": schema["jql"],
+            "names": schema["names"],
+            "schema": schema["schema"],
+            "issues": schema["issues"],
+            "raw_issues": schema["raw_issues"],
+            "count": schema["count"],
+        }
+
+    def get_jira_schema_from_confluence_page_url(
+        self,
+        page_url: str,
+        project_keys: list[str] | tuple[str, ...] | set[str] | None = None,
+        fields: list[str] | None = None,
+        body_format: str = "storage",
+        confluence_client: Any | None = None,
+    ) -> dict[str, Any]:
+        if confluence_client is None:
+            from confluence_client import ConfluenceClient
+
+            confluence_client = ConfluenceClient.from_env(
+                timeout_seconds=self.config.timeout_seconds,
+            )
+
+        page_context = confluence_client.get_page_context_by_url(
+            page_url,
+            body_format=body_format,
+        )
+        return self.get_jira_schema_from_page_context(
+            page_context,
+            project_keys=project_keys,
+            fields=fields,
+        )
+
+    def get_jira_schema_from_page_id(
+        self,
+        confluence_client: Any,
+        page_id: str,
+        project_keys: list[str] | tuple[str, ...] | set[str] | None = None,
+        fields: list[str] | None = None,
+        body_format: str = "storage",
+    ) -> dict[str, Any]:
+        page_context = confluence_client.get_page_context_by_id(
+            page_id,
+            body_format=body_format,
+        )
+        return self.get_jira_schema_from_page_context(
+            page_context,
+            project_keys=project_keys,
+            fields=fields,
+        )
+
+    def get_jira_schema_from_macros(
+        self,
+        jira_macros: list[dict[str, Any]],
+        project_keys: list[str] | tuple[str, ...] | set[str] | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_project_keys = self.normalize_project_keys(project_keys)
+        filtered_macros = []
+        ignored_jira_macros = []
+
+        for macro in jira_macros:
+            issue_key = macro.get("key")
+            if self.issue_matches_project_keys(issue_key, normalized_project_keys):
+                filtered_macros.append(macro)
+            else:
+                ignored_jira_macros.append(macro)
+
+        issue_keys = self._unique_values(
+            macro.get("key")
+            for macro in filtered_macros
+            if macro.get("key")
+        )
+        schema = self.get_issue_keys_schema(issue_keys, fields=fields)
+
+        return {
+            "project_keys": sorted(normalized_project_keys),
+            "issue_keys": issue_keys,
+            "jira_macros": filtered_macros,
+            "ignored_jira_macros": ignored_jira_macros,
+            "jql": schema["jql"],
+            "names": schema["names"],
+            "schema": schema["schema"],
+            "issues": schema["issues"],
+            "raw_issues": schema["raw_issues"],
+            "count": schema["count"],
         }
 
     def get_jira_links_from_macros(
@@ -351,9 +549,9 @@ class JiraClient:
         project = fields.get("project") or {}
         assignee = fields.get("assignee") or {}
         priority = fields.get("priority") or {}
+        comment_page = fields.get("comment")
         issue_key = issue.get("key")
-
-        return {
+        issue_summary = {
             "id": issue.get("id"),
             "key": issue_key,
             "url": self.issue_url(issue_key),
@@ -369,9 +567,30 @@ class JiraClient:
             "priority": priority.get("name") if priority else None,
             "updated": fields.get("updated"),
         }
+        if comment_page is not None:
+            issue_summary["comments"] = self.summarize_comments(comment_page)
+
+        return issue_summary
 
     def summarize_issues(self, issues: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         return [self.summarize_issue(issue) for issue in issues]
+
+    def summarize_comments(self, comment_page: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "total": comment_page.get("total", 0),
+            "max_results": comment_page.get("maxResults"),
+            "start_at": comment_page.get("startAt"),
+            "comments": [
+                {
+                    "id": comment.get("id"),
+                    "author": (comment.get("author") or {}).get("displayName"),
+                    "created": comment.get("created"),
+                    "updated": comment.get("updated"),
+                    "body": self._adf_to_text(comment.get("body")),
+                }
+                for comment in comment_page.get("comments", [])
+            ],
+        }
 
     def jira_issue_context(
         self,
@@ -388,6 +607,32 @@ class JiraClient:
             return None
 
         return f"{self._site_url()}/browse/{issue_key}"
+
+    def issue_key_from_url(self, page_url: str) -> str:
+        parsed_url = urlparse(page_url)
+        query = parse_qs(parsed_url.query)
+
+        for query_key in ("selectedIssue", "issueKey", "issue"):
+            if query.get(query_key):
+                return self._normalize_issue_key(query[query_key][0])
+
+        path_parts = [unquote(part) for part in parsed_url.path.split("/") if part]
+        if "browse" in path_parts:
+            browse_index = path_parts.index("browse")
+            if len(path_parts) > browse_index + 1:
+                return self._normalize_issue_key(path_parts[browse_index + 1])
+
+        for part in reversed(path_parts):
+            try:
+                return self._normalize_issue_key(part)
+            except ValueError:
+                continue
+
+        raise ValueError(
+            "Could not find a Jira issue key in the URL. "
+            "Use a URL like https://your-site.atlassian.net/browse/ABC-123 "
+            "or a Jira URL with selectedIssue=ABC-123."
+        )
 
     def normalize_project_keys(
         self,
@@ -407,6 +652,72 @@ class JiraClient:
 
         issue_project_key = issue_key.split("-", 1)[0].upper()
         return issue_project_key in project_keys
+
+    def _normalize_issue_key(self, issue_key: str) -> str:
+        normalized_issue_key = unquote(issue_key).strip().upper()
+        if "/" in normalized_issue_key:
+            normalized_issue_key = normalized_issue_key.split("/", 1)[0]
+
+        if "-" not in normalized_issue_key:
+            raise ValueError(f"Invalid Jira issue key: {issue_key}")
+
+        project_key, issue_number = normalized_issue_key.split("-", 1)
+        if not project_key or not issue_number.isdigit():
+            raise ValueError(f"Invalid Jira issue key: {issue_key}")
+
+        return f"{project_key}-{issue_number}"
+
+    def _unique_values(self, values: Iterable[str | None]) -> list[str]:
+        unique_values = []
+        seen_values = set()
+        for value in values:
+            if not value:
+                continue
+
+            normalized_value = value.strip()
+            if not normalized_value or normalized_value in seen_values:
+                continue
+
+            unique_values.append(normalized_value)
+            seen_values.add(normalized_value)
+
+        return unique_values
+
+    def _quote_jql_value(self, value: str) -> str:
+        escaped_value = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped_value}"'
+
+    def _adf_to_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+
+        if isinstance(value, str):
+            return value
+
+        if isinstance(value, list):
+            return self._join_text_parts(self._adf_to_text(item) for item in value)
+
+        if not isinstance(value, dict):
+            return str(value)
+
+        node_type = value.get("type")
+        if node_type == "text":
+            return value.get("text", "")
+
+        if node_type == "hardBreak":
+            return "\n"
+
+        content = value.get("content", [])
+        text = self._join_text_parts(self._adf_to_text(item) for item in content)
+        if node_type in {"paragraph", "heading", "blockquote", "bulletList", "orderedList", "listItem"}:
+            return f"{text}\n" if text else ""
+
+        return text
+
+    def _join_text_parts(self, parts: Iterable[str]) -> str:
+        text = "".join(parts)
+        lines = [" ".join(line.split()) for line in text.splitlines()]
+        return "\n".join(line for line in lines if line)
 
     def _request_json(
         self,
@@ -474,7 +785,31 @@ class JiraClient:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Query Jira issues with JQL.")
-    parser.add_argument("jql", help='JQL query, for example: "project = KAN ORDER BY updated DESC"')
+    parser.add_argument(
+        "jql",
+        nargs="?",
+        help='JQL query, for example: "project = KAN ORDER BY updated DESC"',
+    )
+    parser.add_argument(
+        "--page-url",
+        default=None,
+        help="Jira issue page URL. When set with --schema, returns the Jira schema for that issue.",
+    )
+    parser.add_argument(
+        "--confluence-page-url",
+        default=None,
+        help=(
+            "Confluence page URL. When set with --schema, returns the Jira schema "
+            "for Jira macros on that Confluence page."
+        ),
+    )
+    parser.add_argument(
+        "--project-key",
+        "--project-keys",
+        action="append",
+        default=[],
+        help="Jira project key(s) to include from a Confluence page. Can be repeated or comma-separated.",
+    )
     parser.add_argument(
         "--field",
         action="append",
@@ -485,8 +820,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--all", action="store_true", help="Fetch every page of results.")
     parser.add_argument("--page-size", type=int, default=50, help="Page size when using --all.")
     parser.add_argument("--max-pages", type=int, default=None, help="Maximum pages when using --all.")
+    parser.add_argument("--schema", action="store_true", help="Print Jira field names and schema for the JQL.")
     parser.add_argument("--raw", action="store_true", help="Print the raw Jira API response as JSON.")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if not args.jql and not args.page_url and not args.confluence_page_url:
+        parser.error("Provide a JQL query, --page-url, or --confluence-page-url.")
+
+    if (args.page_url or args.confluence_page_url) and not args.schema:
+        parser.error("--page-url and --confluence-page-url are currently supported with --schema.")
+
+    args.project_key = split_csv_args(args.project_key)
+    return args
 
 
 def split_csv_args(values: list[str]) -> list[str]:
@@ -499,11 +844,35 @@ def split_csv_args(values: list[str]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    fields = split_csv_args(args.field) or DEFAULT_FIELDS
+    requested_fields = split_csv_args(args.field)
+    fields = requested_fields or DEFAULT_FIELDS
     client = JiraClient.from_env()
 
     try:
-        if args.all:
+        if args.page_url:
+            output = client.get_jira_schema_from_page_url(
+                page_url=args.page_url,
+                fields=requested_fields or None,
+            )
+            if not args.raw:
+                output.pop("raw_issue", None)
+        elif args.confluence_page_url:
+            output = client.get_jira_schema_from_confluence_page_url(
+                page_url=args.confluence_page_url,
+                project_keys=args.project_key,
+                fields=requested_fields or None,
+            )
+            if not args.raw:
+                output.pop("raw_issues", None)
+        elif args.schema:
+            output = client.get_jql_schema(
+                jql=args.jql,
+                fields=requested_fields or None,
+                max_results=args.max_results,
+            )
+            if not args.raw:
+                output.pop("raw_issues", None)
+        elif args.all:
             issues = client.search_all_issues(
                 jql=args.jql,
                 fields=fields,

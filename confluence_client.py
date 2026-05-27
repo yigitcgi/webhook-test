@@ -149,6 +149,14 @@ class ConfluenceClient:
 
         return results[0]
 
+    def get_page_context_by_id(
+        self,
+        page_id: str,
+        body_format: str = "storage",
+    ) -> dict[str, Any]:
+        page = self.get_page_by_id(page_id, body_format=body_format)
+        return self._page_context(page, page_id, body_format)
+
     def get_page_context_by_url(
         self,
         page_url: str,
@@ -161,6 +169,14 @@ class ConfluenceClient:
             space_key, title = self._page_space_and_title_from_url(page_url)
             page = self.get_page_by_title(space_key, title, body_format=body_format)
 
+        return self._page_context(page, page_url, body_format)
+
+    def _page_context(
+        self,
+        page: dict[str, Any],
+        fallback_url: str,
+        body_format: str,
+    ) -> dict[str, Any]:
         body = page.get("body", {}).get(body_format, {})
         body_value = body.get("value", "")
         links = page.get("_links", {})
@@ -180,7 +196,7 @@ class ConfluenceClient:
                 "when": version.get("when"),
                 "by": version.get("by", {}).get("displayName"),
             },
-            "url": self._absolute_confluence_url(links.get("webui", page_url)),
+            "url": self._absolute_confluence_url(links.get("webui", fallback_url)),
             "body_format": body.get("representation", body_format),
             "text": self._html_to_text(body_value),
             "raw_body": body_value,
