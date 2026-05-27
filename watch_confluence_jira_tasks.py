@@ -9,9 +9,10 @@ from typing import Any
 from urllib.error import URLError
 
 from confluence_client import ConfluenceAPIError, ConfluenceClient
+from jira_client import JiraAPIError, JiraClient
 
 
-DEFAULT_INTERVAL_SECONDS = 1
+DEFAULT_INTERVAL_SECONDS = 60
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,12 +84,17 @@ def split_csv_args(values: list[str]) -> list[str]:
 
 
 def check_page(
-    client: ConfluenceClient,
+    confluence_client: ConfluenceClient,
+    jira_client: JiraClient,
     page_url: str,
     project_keys: list[str],
     done_statuses: list[str],
 ) -> bool:
-    result = client.get_jira_links_from_page_url(page_url, project_keys=project_keys)
+    page_context = confluence_client.get_page_context_by_url(page_url)
+    result = jira_client.get_jira_links_from_page_context(
+        page_context,
+        project_keys=project_keys,
+    )
     jira_links = result["jira_links"]
     ignored_count = len(result.get("ignored_jira_macros", []))
     page = result["page"]
@@ -156,19 +162,26 @@ def is_completed(jira_link: dict[str, Any], done_statuses: list[str]) -> bool:
 
 def main() -> int:
     args = parse_args()
-    client = ConfluenceClient.from_env()
+    confluence_client = ConfluenceClient.from_env()
+    jira_client = JiraClient.from_env()
 
     try:
         while True:
             try:
                 all_done = check_page(
-                    client=client,
+                    confluence_client=confluence_client,
+                    jira_client=jira_client,
                     page_url=args.page_url,
                     project_keys=args.project_key,
                     done_statuses=args.done_status,
                 )
             except ConfluenceAPIError as error:
-                print(f"Atlassian API error: {error}", file=sys.stderr)
+                print(f"Confluence API error: {error}", file=sys.stderr)
+                if error.response_body:
+                    print(error.response_body[:500], file=sys.stderr)
+                all_done = False
+            except JiraAPIError as error:
+                print(f"Jira API error: {error}", file=sys.stderr)
                 if error.response_body:
                     print(error.response_body[:500], file=sys.stderr)
                 all_done = False

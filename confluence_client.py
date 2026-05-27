@@ -3,13 +3,12 @@ from __future__ import annotations
 import base64
 import json
 import os
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
@@ -23,7 +22,7 @@ class ConfluenceAPIError(RuntimeError):
         self.status_code = status_code
         self.reason = reason
         self.response_body = response_body
-        super().__init__(f"Atlassian API request failed: HTTP {status_code} {reason}")
+        super().__init__(f"Confluence API request failed: HTTP {status_code} {reason}")
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -65,52 +64,6 @@ class _HTMLTextExtractor(HTMLParser):
     def text(self) -> str:
         lines = [" ".join(line.split()) for line in "".join(self._parts).splitlines()]
         return "\n".join(line for line in lines if line)
-
-
-class _JiraMacroExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.macros: list[dict[str, Any]] = []
-        self._current_macro: dict[str, Any] | None = None
-        self._current_param: str | None = None
-        self._current_param_parts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = dict(attrs)
-        if tag == "ac:structured-macro" and attributes.get("ac:name") == "jira":
-            self._current_macro = {
-                "key": None,
-                "server": None,
-                "server_id": None,
-                "macro_id": attributes.get("ac:macro-id"),
-                "local_id": attributes.get("ac:local-id"),
-                "parameters": {},
-            }
-            return
-
-        if self._current_macro and tag == "ac:parameter":
-            self._current_param = attributes.get("ac:name")
-            self._current_param_parts = []
-
-    def handle_data(self, data: str) -> None:
-        if self._current_macro and self._current_param:
-            self._current_param_parts.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        if self._current_macro and self._current_param and tag == "ac:parameter":
-            value = "".join(self._current_param_parts).strip()
-            self._current_macro["parameters"][self._current_param] = value
-            self._current_param = None
-            self._current_param_parts = []
-            return
-
-        if self._current_macro and tag == "ac:structured-macro":
-            parameters = self._current_macro["parameters"]
-            self._current_macro["key"] = parameters.get("key")
-            self._current_macro["server"] = parameters.get("server")
-            self._current_macro["server_id"] = parameters.get("serverId")
-            self.macros.append(self._current_macro)
-            self._current_macro = None
 
 
 @dataclass(frozen=True)
@@ -230,7 +183,6 @@ class ConfluenceClient:
             "url": self._absolute_confluence_url(links.get("webui", page_url)),
             "body_format": body.get("representation", body_format),
             "text": self._html_to_text(body_value),
-            "jira_macros": self._extract_jira_macros(body_value),
             "raw_body": body_value,
         }
 
@@ -245,106 +197,6 @@ class ConfluenceClient:
             },
         )
 
-    def get_jira_current_user(self, expand: str | None = None) -> dict[str, Any]:
-        params = {"expand": expand} if expand else None
-        return self._request_jira_json("GET", "myself", params=params)
-
-    def list_jira_application_roles(self) -> dict[str, Any]:
-        user = self.get_jira_current_user(expand="applicationRoles")
-        return user.get("applicationRoles", {})
-
-    def list_jira_projects(self, max_results: int = 50) -> dict[str, Any]:
-        return self._request_jira_json(
-            "GET",
-            "project/search",
-            params={"maxResults": max_results},
-        )
-
-    def get_jira_issue(
-        self,
-        issue_key: str,
-        fields: list[str] | None = None,
-    ) -> dict[str, Any]:
-        selected_fields = fields or [
-            "summary",
-            "status",
-            "issuetype",
-            "project",
-            "assignee",
-            "priority",
-            "updated",
-        ]
-        return self._request_jira_json(
-            "GET",
-            f"issue/{quote(issue_key, safe='')}",
-            params={"fields": ",".join(selected_fields)},
-        )
-
-    def get_jira_links_from_page_url(
-        self,
-        page_url: str,
-        project_keys: list[str] | tuple[str, ...] | set[str] | None = None,
-    ) -> dict[str, Any]:
-        page_context = self.get_page_context_by_url(page_url)
-        normalized_project_keys = self._normalize_project_keys(project_keys)
-        issue_cache: dict[str, dict[str, Any] | ConfluenceAPIError] = {}
-        jira_links = []
-        ignored_jira_macros = []
-
-        for macro in page_context["jira_macros"]:
-            issue_key = macro.get("key")
-            if not self._issue_matches_project_keys(issue_key, normalized_project_keys):
-                ignored_jira_macros.append(macro)
-                continue
-
-            if not issue_key:
-                jira_links.append(
-                    {
-                        "key": None,
-                        "url": None,
-                        "status": None,
-                        "summary": None,
-                        "macro": macro,
-                        "error": "Jira macro does not contain a single issue key.",
-                    }
-                )
-                continue
-
-            if issue_key not in issue_cache:
-                try:
-                    issue_cache[issue_key] = self.get_jira_issue(issue_key)
-                except ConfluenceAPIError as error:
-                    issue_cache[issue_key] = error
-
-            issue_or_error = issue_cache[issue_key]
-            if isinstance(issue_or_error, ConfluenceAPIError):
-                jira_links.append(
-                    {
-                        "key": issue_key,
-                        "url": self._jira_issue_url(issue_key),
-                        "status": None,
-                        "summary": None,
-                        "macro": macro,
-                        "error": str(issue_or_error),
-                        "error_detail": issue_or_error.response_body[:500],
-                    }
-                )
-                continue
-
-            jira_links.append(self._jira_issue_context(issue_or_error, macro))
-
-        return {
-            "page": {
-                "id": page_context["id"],
-                "title": page_context["title"],
-                "url": page_context["url"],
-                "space": page_context["space"],
-            },
-            "jira_links": jira_links,
-            "ignored_jira_macros": ignored_jira_macros,
-            "project_keys": sorted(normalized_project_keys),
-        }
-
     def _request_confluence_json(
         self,
         method: str,
@@ -353,15 +205,6 @@ class ConfluenceClient:
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self._request_json(method, self._confluence_api_url(endpoint, params), payload)
-
-    def _request_jira_json(
-        self,
-        method: str,
-        endpoint: str,
-        params: dict[str, Any] | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return self._request_json(method, self._jira_api_url(endpoint, params), payload)
 
     def _request_json(
         self,
@@ -406,20 +249,6 @@ class ConfluenceClient:
             url = f"{url}?{urlencode(params)}"
 
         return url
-
-    def _jira_api_url(self, endpoint: str, params: dict[str, Any] | None = None) -> str:
-        url = f"{self._site_url()}/rest/api/3/{endpoint.lstrip('/')}"
-        if params:
-            url = f"{url}?{urlencode(params)}"
-
-        return url
-
-    def _site_url(self) -> str:
-        base = self.config.base_url.rstrip("/")
-        if base.endswith("/wiki"):
-            return base[: -len("/wiki")]
-
-        return base
 
     def _absolute_confluence_url(self, path_or_url: str) -> str:
         if path_or_url.startswith(("http://", "https://")):
@@ -470,115 +299,6 @@ class ConfluenceClient:
         parser = _HTMLTextExtractor()
         parser.feed(html)
         return parser.text()
-
-    def _extract_jira_macros(self, storage_body: str) -> list[dict[str, Any]]:
-        if not storage_body:
-            return []
-
-        wrapped_body = (
-            '<root xmlns:ac="http://atlassian.com/content" '
-            'xmlns:ri="http://atlassian.com/resource/identifier">'
-            f"{storage_body}</root>"
-        )
-        try:
-            root = ET.fromstring(wrapped_body)
-        except ET.ParseError:
-            parser = _JiraMacroExtractor()
-            parser.feed(storage_body)
-            return parser.macros
-
-        macros = []
-        for element in root.iter():
-            if self._local_name(element.tag) != "structured-macro":
-                continue
-
-            if self._attribute_value(element.attrib, "name") != "jira":
-                continue
-
-            parameters = {}
-            for child in element:
-                if self._local_name(child.tag) != "parameter":
-                    continue
-
-                parameter_name = self._attribute_value(child.attrib, "name")
-                if parameter_name:
-                    parameters[parameter_name] = "".join(child.itertext()).strip()
-
-            macros.append(
-                {
-                    "key": parameters.get("key"),
-                    "server": parameters.get("server"),
-                    "server_id": parameters.get("serverId"),
-                    "macro_id": self._attribute_value(element.attrib, "macro-id"),
-                    "local_id": self._attribute_value(element.attrib, "local-id"),
-                    "parameters": parameters,
-                }
-            )
-
-        return macros
-
-    def _jira_issue_context(self, issue: dict[str, Any], macro: dict[str, Any]) -> dict[str, Any]:
-        fields = issue.get("fields", {})
-        status = fields.get("status") or {}
-        status_category = status.get("statusCategory") or {}
-        issue_type = fields.get("issuetype") or {}
-        project = fields.get("project") or {}
-        assignee = fields.get("assignee") or {}
-        priority = fields.get("priority") or {}
-        issue_key = issue.get("key") or macro.get("key")
-
-        return {
-            "key": issue_key,
-            "url": self._jira_issue_url(issue_key),
-            "summary": fields.get("summary"),
-            "status": status.get("name"),
-            "status_category": status_category.get("name"),
-            "issue_type": issue_type.get("name"),
-            "project": {
-                "key": project.get("key"),
-                "name": project.get("name"),
-            },
-            "assignee": assignee.get("displayName") if assignee else None,
-            "priority": priority.get("name") if priority else None,
-            "updated": fields.get("updated"),
-            "macro": macro,
-            "error": None,
-        }
-
-    def _jira_issue_url(self, issue_key: str | None) -> str | None:
-        if not issue_key:
-            return None
-
-        return f"{self._site_url()}/browse/{issue_key}"
-
-    def _normalize_project_keys(
-        self,
-        project_keys: list[str] | tuple[str, ...] | set[str] | None,
-    ) -> set[str]:
-        if not project_keys:
-            return set()
-
-        return {project_key.strip().upper() for project_key in project_keys if project_key.strip()}
-
-    def _issue_matches_project_keys(self, issue_key: str | None, project_keys: set[str]) -> bool:
-        if not project_keys:
-            return True
-
-        if not issue_key or "-" not in issue_key:
-            return False
-
-        issue_project_key = issue_key.split("-", 1)[0].upper()
-        return issue_project_key in project_keys
-
-    def _local_name(self, name: str) -> str:
-        return name.rsplit("}", 1)[-1].split(":", 1)[-1]
-
-    def _attribute_value(self, attributes: dict[str, str], attribute_name: str) -> str | None:
-        for key, value in attributes.items():
-            if self._local_name(key) == attribute_name:
-                return value
-
-        return None
 
     def _authorization_header(self) -> str:
         credentials = f"{self.config.email}:{self.config.api_token}".encode("utf-8")
