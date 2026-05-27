@@ -109,11 +109,91 @@ class ConfluenceClient:
     def list_spaces(self, limit: int = 25) -> dict[str, Any]:
         return self._request_confluence_json("GET", "space", params={"limit": limit})
 
+    def get_space_by_key(self, space_key: str) -> dict[str, Any]:
+        return self._request_confluence_json("GET", f"space/{space_key}")
+
+    def get_space_id(self, space_key: str) -> str:
+        space = self.get_space_by_key(space_key)
+        space_id = space.get("id")
+        if not space_id:
+            raise ValueError(f"Could not resolve Confluence space ID for space key: {space_key}")
+
+        return str(space_id)
+
     def search_content(self, cql: str, limit: int = 10) -> dict[str, Any]:
         return self._request_confluence_json(
             "GET",
             "content/search",
             params={"cql": cql, "limit": limit},
+        )
+
+    def create_page(
+        self,
+        title: str,
+        body: str,
+        space_key: str | None = None,
+        space_id: str | int | None = None,
+        parent_id: str | int | None = None,
+        representation: str = "storage",
+        status: str = "current",
+        subtype: str | None = "live",
+        embedded: bool | None = None,
+        private: bool | None = None,
+        root_level: bool | None = None,
+    ) -> dict[str, Any]:
+        if not title.strip():
+            raise ValueError("Page title is required.")
+
+        resolved_space_id = self._resolve_space_id(space_key=space_key, space_id=space_id)
+        payload: dict[str, Any] = {
+            "spaceId": resolved_space_id,
+            "status": status,
+            "title": title,
+            "body": {
+                "representation": representation,
+                "value": body,
+            },
+        }
+        if parent_id is not None:
+            payload["parentId"] = str(parent_id)
+
+        if subtype is not None:
+            payload["subtype"] = subtype
+
+        params = self._page_create_query_params(
+            embedded=embedded,
+            private=private,
+            root_level=root_level,
+        )
+        return self._request_confluence_v2_json(
+            "POST",
+            "pages",
+            params=params,
+            payload=payload,
+        )
+
+    def create_child_page(
+        self,
+        parent_page_url: str,
+        title: str,
+        body: str,
+        representation: str = "storage",
+        status: str = "current",
+        subtype: str | None = "live",
+    ) -> dict[str, Any]:
+        parent_page = self.get_page_context_by_url(parent_page_url)
+        space_id = parent_page.get("space", {}).get("id")
+        if not space_id:
+            raise ValueError(f"Could not resolve parent page space ID: {parent_page_url}")
+
+        return self.create_page(
+            title=title,
+            body=body,
+            space_id=space_id,
+            parent_id=parent_page["id"],
+            representation=representation,
+            status=status,
+            subtype=subtype,
         )
 
     def get_page_by_id(
@@ -222,6 +302,15 @@ class ConfluenceClient:
     ) -> dict[str, Any]:
         return self._request_json(method, self._confluence_api_url(endpoint, params), payload)
 
+    def _request_confluence_v2_json(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request_json(method, self._confluence_v2_api_url(endpoint, params), payload)
+
     def _request_json(
         self,
         method: str,
@@ -265,6 +354,48 @@ class ConfluenceClient:
             url = f"{url}?{urlencode(params)}"
 
         return url
+
+    def _confluence_v2_api_url(self, endpoint: str, params: dict[str, Any] | None = None) -> str:
+        base = self.config.base_url.rstrip("/")
+        if not base.endswith("/wiki"):
+            base = f"{base}/wiki"
+
+        url = f"{base}/api/v2/{endpoint.lstrip('/')}"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+
+        return url
+
+    def _resolve_space_id(
+        self,
+        space_key: str | None,
+        space_id: str | int | None,
+    ) -> str:
+        if space_id is not None:
+            return str(space_id)
+
+        if space_key:
+            return self.get_space_id(space_key)
+
+        raise ValueError("Either space_id or space_key is required.")
+
+    def _page_create_query_params(
+        self,
+        embedded: bool | None,
+        private: bool | None,
+        root_level: bool | None,
+    ) -> dict[str, str] | None:
+        params = {}
+        if embedded is not None:
+            params["embedded"] = str(embedded).lower()
+
+        if private is not None:
+            params["private"] = str(private).lower()
+
+        if root_level is not None:
+            params["root-level"] = str(root_level).lower()
+
+        return params or None
 
     def _absolute_confluence_url(self, path_or_url: str) -> str:
         if path_or_url.startswith(("http://", "https://")):
