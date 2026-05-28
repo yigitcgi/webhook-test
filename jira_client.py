@@ -293,9 +293,14 @@ class JiraClient:
         self,
         page_context: dict[str, Any],
         project_keys: list[str] | tuple[str, ...] | set[str] | None = None,
+        issue_fields: list[str] | None = None,
     ) -> dict[str, Any]:
         jira_macros = self.extract_jira_macros_from_page_context(page_context)
-        jira_links = self.get_jira_links_from_macros(jira_macros, project_keys=project_keys)
+        jira_links = self.get_jira_links_from_macros(
+            jira_macros,
+            project_keys=project_keys,
+            issue_fields=issue_fields,
+        )
         normalized_project_keys = self.normalize_project_keys(project_keys)
 
         return {
@@ -438,6 +443,7 @@ class JiraClient:
         self,
         jira_macros: list[dict[str, Any]],
         project_keys: list[str] | tuple[str, ...] | set[str] | None = None,
+        issue_fields: list[str] | None = None,
     ) -> dict[str, Any]:
         normalized_project_keys = self.normalize_project_keys(project_keys)
         issue_cache: dict[str, dict[str, Any] | JiraAPIError] = {}
@@ -465,7 +471,7 @@ class JiraClient:
 
             if issue_key not in issue_cache:
                 try:
-                    issue_cache[issue_key] = self.get_issue(issue_key)
+                    issue_cache[issue_key] = self.get_issue(issue_key, fields=issue_fields)
                 except JiraAPIError as error:
                     issue_cache[issue_key] = error
 
@@ -550,12 +556,14 @@ class JiraClient:
         assignee = fields.get("assignee") or {}
         priority = fields.get("priority") or {}
         comment_page = fields.get("comment")
+        description = fields.get("description")
         issue_key = issue.get("key")
         issue_summary = {
             "id": issue.get("id"),
             "key": issue_key,
             "url": self.issue_url(issue_key),
             "summary": fields.get("summary"),
+            "description": self._adf_to_text(description) if description is not None else None,
             "status": status.get("name"),
             "status_category": status_category.get("name"),
             "issue_type": issue_type.get("name"),
@@ -565,7 +573,10 @@ class JiraClient:
             },
             "assignee": assignee.get("displayName") if assignee else None,
             "priority": priority.get("name") if priority else None,
+            "created": fields.get("created"),
             "updated": fields.get("updated"),
+            "due_date": fields.get("duedate"),
+            "labels": fields.get("labels", []),
         }
         if comment_page is not None:
             issue_summary["comments"] = self.summarize_comments(comment_page)
